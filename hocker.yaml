@@ -1,0 +1,61 @@
+# Lima VM for developing hocker on macOS.
+#
+# hocker needs Linux kernel features (namespaces, cgroup v2) that do not exist
+# on macOS, so this boots an Ubuntu VM with everything the runtime expects:
+# cgroup v2 (Ubuntu's default), iproute2 and iptables for --net, and a Go
+# toolchain new enough for the go directive in go.mod. The repository is mounted
+# writable, so you edit on macOS and build and run inside the VM.
+#
+#   limactl start hocker.yaml   # boot the VM (named "hocker")
+#   limactl shell hocker        # open a shell inside it
+#
+# Inside the shell the repo is at the same path as on the host.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 2
+memory: "2GiB"
+disk: "20GiB"
+
+# Mount the repo writable so builds and the unpacked rootfs land back on the host.
+mounts:
+  - location: "~/Projects/hocker"
+    writable: true
+
+# Install the host-side tools hocker shells out to, plus an upstream Go toolchain
+# (Ubuntu's packaged Go is older than the go directive in go.mod).
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y iproute2 iptables curl ca-certificates
+      if [ ! -x /usr/local/go/bin/go ]; then
+        ARCH="$(dpkg --print-architecture)"
+        GO_VER="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -1)"
+        curl -fsSL "https://go.dev/dl/${GO_VER}.linux-${ARCH}.tar.gz" -o /tmp/go.tar.gz
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm -f /tmp/go.tar.gz
+      fi
+      install -m 0644 /dev/stdin /etc/profile.d/go.sh <<'EOF'
+      export PATH="$PATH:/usr/local/go/bin"
+      EOF
+
+# Surface the toolchain and kernel features in `limactl start`'s readiness check.
+probes:
+  - description: "Go toolchain and cgroup v2"
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if ! timeout 60s bash -c "until [ -x /usr/local/go/bin/go ]; do sleep 1; done"; then
+        echo >&2 "go was not installed"
+        exit 1
+      fi
+    hint: "Go did not install. Check /var/log/cloud-init-output.log inside the VM."

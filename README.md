@@ -31,12 +31,16 @@ run it inside a Linux virtual machine.
 ### Developing on macOS with Lima
 
 Lima boots a Linux virtual machine and mounts your files into it, so you can
-edit on macOS and run on Linux.
+edit on macOS and run on Linux. This repository ships a Lima config that
+provisions a VM with everything hocker expects: cgroup v2, iproute2 and iptables
+for networking, and a Go toolchain new enough for the go directive in go.mod.
+The repository is mounted into the VM at the same path it has on the host.
 
 ```sh
 brew install lima
-limactl start          # boots a Linux VM and mounts your home directory
-lima                   # opens a shell inside the VM, with this repo available
+limactl start hocker.yaml   # boots the VM, named "hocker", and provisions it
+limactl shell hocker        # opens a shell inside the VM
+limactl stop hocker         # shuts the VM down when you are done
 ```
 
 Inside that shell the kernel features hocker needs are real, so the steps below
