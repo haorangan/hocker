@@ -57,6 +57,16 @@ func setupCgroupParent(hostPid int) (string, error) {
 	if err := writeCgroup(leaf, "memory.max", strconv.Itoa(memoryLimitBytes)); err != nil {
 		return leaf, err
 	}
+	// Deny the container swap, so reaching memory.max actually triggers the OOM
+	// kill rather than spilling into swap and running on past the limit. The
+	// file is absent when the kernel has no swap accounting, in which case there
+	// is no swap to escape into anyway, so we only require the write to succeed
+	// when the control exists.
+	if _, err := os.Stat(filepath.Join(leaf, "memory.swap.max")); err == nil {
+		if err := writeCgroup(leaf, "memory.swap.max", "0"); err != nil {
+			return leaf, err
+		}
+	}
 	if err := writeCgroup(leaf, "pids.max", strconv.Itoa(pidsLimit)); err != nil {
 		return leaf, err
 	}
