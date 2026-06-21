@@ -8,7 +8,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
+)
+
+// The container's users live in a private user namespace, mapped onto an
+// unprivileged block of host ids. Container uid/gid 0..65535 become host
+// 524288..589823, so root inside the container has no authority on the host.
+// The base sits inside the range /etc/subuid delegates to a normal user.
+const (
+	subuidBase = 524288
+	subuidSize = 65536
 )
 
 // run is the user-facing entrypoint. There is no "create a container" syscall;
@@ -16,22 +27,62 @@ import (
 // re-execute hocker itself as the hidden "child" command inside a fresh set of
 // namespaces, because we cannot safely apply these flags to the already-running
 // Go runtime. The clean trick is to hand them to a brand new process.
+//
+// Because the child runs in a user namespace, it is unprivileged on the host
+// and cannot touch the host's cgroup filesystem or move a veth interface. So
+// every privileged, host-side step (cgroup limits, networking) is done here in
+// the real-root parent. The child blocks on a sync pipe until we have finished,
+// so its workload never runs before its limits and network are in place.
 func run(args []string) {
+	code := 0
+	defer func() { os.Exit(code) }() // runs last; lets the cleanup defers below fire first
+
 	net := false
 	if len(args) > 0 && args[0] == "--net" {
 		net, args = true, args[1:]
 	}
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "hocker run: need a command, e.g. `hocker run /bin/sh`")
-		os.Exit(1)
+		code = 1
+		return
+	}
+
+	// The container root is an unprivileged host uid, so it cannot use the
+	// pristine image (owned by host root, which is unmapped). Copy the image to
+	// a private per-run directory and shift its ownership into the mapped range.
+	runRoot, err := prepareRootfs(rootfsPath())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hocker: rootfs:", err)
+		code = 1
+		return
+	}
+	defer os.RemoveAll(runRoot)
+
+	// Reserve a network slot and create the veth pair up front: neither needs
+	// the child's pid, and claiming the slot under a lock keeps concurrent
+	// containers from colliding on names or subnets.
+	slot := -1
+	var conf netConf
+	if net {
+		conf, err = allocNetSlot()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "hocker: network alloc:", err)
+			code = 1
+			return
+		}
+		slot = conf.slot
+		defer teardownHostNetwork(conf)
+		defer releaseNetSlot(conf)
 	}
 
 	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, args...)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "HOCKER_ROOTFS="+runRoot)
 
-	cloneFlags := syscall.CLONE_NEWUTS | // own hostname
+	cloneFlags := syscall.CLONE_NEWUSER | // own user/group id space; root here is not root on the host
+		syscall.CLONE_NEWUTS | // own hostname
 		syscall.CLONE_NEWPID | // own PID number space (child sees itself as PID 1)
 		syscall.CLONE_NEWNS // own mount table
 	if net {
@@ -40,66 +91,95 @@ func run(args []string) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags:   uintptr(cloneFlags),
 		Unshareflags: syscall.CLONE_NEWNS, // keep our mounts from propagating back to the host
+		// The parent is real root, so Go writes these maps to /proc/<pid>/{uid,gid}_map
+		// directly, with no newuidmap/newgidmap helper needed.
+		UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: subuidBase, Size: subuidSize}},
+		GidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: subuidBase, Size: subuidSize}},
+		GidMappingsEnableSetgroups: false, // write "deny" to setgroups before gid_map, as the kernel requires
+		// We are root, so the cloned child starts as host uid 0, which is not in
+		// the map above and would appear as "nobody" with no capabilities. As
+		// the namespace creator it still holds CAP_SETUID inside the namespace,
+		// so we have it switch to container uid 0 (host 524288) before it
+		// re-execs. After that exec, euid 0 inside the namespace gives it a full
+		// capability set there while remaining unprivileged on the host.
+		Credential: &syscall.Credential{Uid: 0, Gid: 0, NoSetGroups: true},
 	}
 
-	// With networking on, the host must move a veth interface into the child's
-	// network namespace before the child can configure it. We hand the child
-	// the read end of a pipe and make it wait until we close the write end,
-	// which signals that the interface is in place.
-	var ready *os.File
-	if net {
-		r, w, err := os.Pipe()
-		must(err)
-		cmd.ExtraFiles = []*os.File{r} // the child sees this as fd 3
-		cmd.Env = append(os.Environ(), "HOCKER_NET=1")
-		ready = w
-		defer r.Close()
+	// The sync pipe is always present now. The child blocks reading fd 3 until
+	// we close it, which we do only after the cgroup and network are ready. We
+	// send the network slot (or -1) so the child can rebuild the same netConf.
+	r, w, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hocker: pipe:", err)
+		code = 1
+		return
+	}
+	cmd.ExtraFiles = []*os.File{r} // the child sees this as fd 3
+	defer r.Close()
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "hocker: start:", err)
+		code = 1
+		return
 	}
 
-	must(cmd.Start())
+	hostPid := cmd.Process.Pid
+
+	// Apply resource limits from here: the user-namespaced child cannot write
+	// the host cgroup filesystem itself. We add it by its host pid.
+	leafDir, err := setupCgroupParent(hostPid)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hocker: cgroup:", err)
+	}
+	defer removeCgroup(leafDir)
 
 	if net {
-		if err := setupHostNetwork(cmd.Process.Pid); err != nil {
+		if err := setupHostNetwork(conf, hostPid); err != nil {
 			fmt.Fprintln(os.Stderr, "hocker: network setup:", err)
 		}
-		ready.Close() // release the child now that its interface exists
-		defer teardownHostNetwork()
 	}
+
+	// Release the child: tell it its slot, then close the write end so its read
+	// hits EOF. This single close means "all host-side setup is done".
+	fmt.Fprintf(w, "%d\n", slot)
+	w.Close()
 
 	if err := cmd.Wait(); err != nil {
 		fmt.Fprintln(os.Stderr, "hocker:", err)
-		os.Exit(1)
+		code = 1
 	}
 }
 
 // child runs inside the new namespaces and becomes the container's init process.
+// It is root within its user namespace (mapped to an unprivileged host uid), so
+// it holds CAP_SYS_ADMIN over its own mount/pid namespaces and CAP_NET_ADMIN
+// over its own network namespace, which is all it needs.
 func child(args []string) {
-	// If networking is enabled, wait for the host to place our veth interface,
-	// then configure it. This runs before pivot_root so the host's `ip` binary
-	// is still reachable.
-	if os.Getenv("HOCKER_NET") == "1" {
-		waitForHostNetwork()
-		if err := setupContainerNetwork(); err != nil {
+	// Block until the parent has set up our cgroup and network. The value it
+	// sends is our network slot, or -1 when networking is off.
+	slot := waitForStart()
+	if slot >= 0 {
+		if err := setupContainerNetwork(confForSlot(slot)); err != nil {
 			fmt.Fprintln(os.Stderr, "hocker: container network:", err)
 		}
 	}
 
 	must(syscall.Sethostname([]byte("hocker")))
 
-	// Apply resource limits before chroot, while /sys/fs/cgroup is still reachable.
-	setupCgroup()
-
 	// Swap the root filesystem so the process sees the container image as "/"
-	// instead of the host's files. pivot_root actually moves the mount and lets
-	// us detach the host's root afterwards, which chroot cannot do.
+	// instead of the host's files. pivot_root moves the mount and parks the old
+	// host root at /.old_root, which we detach below once it has served its
+	// purpose. chroot cannot do this.
 	must(pivotRoot(rootfsPath()))
 
 	// Mount a fresh procfs so tools like `ps` see only the container's
-	// processes and /proc reflects the new PID namespace. The rootfs must
-	// contain an empty /proc directory for this to land. Because the mount
-	// namespace is private, the kernel tears this down when the process exits.
-	must(syscall.Mount("proc", "/proc", "proc", 0, ""))
-	defer syscall.Unmount("/proc", 0)
+	// processes and /proc reflects the new PID namespace. The kernel only lets
+	// a user namespace mount a new procfs when an existing one is already
+	// visible to compare against, so we do this while the host's /proc is still
+	// parked under /.old_root, and only then detach the old root. The flags
+	// match the kernel's locked-mount requirements for an unprivileged mount.
+	must(syscall.Mount("proc", "/proc", "proc", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""))
+	must(detachOldRoot())
 
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
@@ -123,7 +203,8 @@ func pivotRoot(newRoot string) error {
 		return fmt.Errorf("bind mount rootfs: %w", err)
 	}
 
-	// A place to park the old root until we can detach it.
+	// A place to park the old root until we can detach it. The mapped container
+	// root can create this because we chowned the image into its id range.
 	oldRoot := filepath.Join(newRoot, ".old_root")
 	if err := os.MkdirAll(oldRoot, 0700); err != nil {
 		return err
@@ -132,11 +213,15 @@ func pivotRoot(newRoot string) error {
 	if err := syscall.PivotRoot(newRoot, oldRoot); err != nil {
 		return fmt.Errorf("pivot_root: %w", err)
 	}
-	if err := os.Chdir("/"); err != nil {
-		return err
-	}
+	return os.Chdir("/")
+}
 
-	// Detach the old root and remove the now-empty mount point.
+// detachOldRoot unmounts the parked host root and removes its mount point. It
+// runs after the fresh /proc is mounted, because that mount needs the old
+// /proc to still be visible underneath /.old_root. MNT_DETACH unmounts the
+// whole inherited subtree as one unit, which is the only form a less-privileged
+// namespace is allowed to perform on locked mounts.
+func detachOldRoot() error {
 	const parkedOldRoot = "/.old_root"
 	if err := syscall.Unmount(parkedOldRoot, syscall.MNT_DETACH); err != nil {
 		return fmt.Errorf("unmount old root: %w", err)
@@ -144,20 +229,27 @@ func pivotRoot(newRoot string) error {
 	return os.Remove(parkedOldRoot)
 }
 
-// waitForHostNetwork blocks until the parent closes the sync pipe (fd 3), which
-// signals that the host has moved our veth interface into this namespace.
-func waitForHostNetwork() {
-	sync := os.NewFile(3, "hocker-net-ready")
+// waitForStart blocks until the parent closes the sync pipe (fd 3), which
+// signals that all host-side setup is done. The parent writes the network slot
+// first; we return it (or -1 if there is no pipe or no network).
+func waitForStart() int {
+	sync := os.NewFile(3, "hocker-start")
 	if sync == nil {
-		return
+		return -1
 	}
-	io.Copy(io.Discard, sync) // returns once the parent closes the write end
+	data, _ := io.ReadAll(sync) // returns once the parent closes the write end
 	sync.Close()
+	slot, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return -1
+	}
+	return slot
 }
 
 // rootfsPath returns the directory to use as the container's root filesystem.
 // Override it with HOCKER_ROOTFS; it defaults to ./rootfs (an unpacked image,
-// e.g. an Alpine mini root fs or `docker export`ed container).
+// e.g. an Alpine mini root fs or `docker export`ed container). In the child
+// this points at the per-run copy the parent prepared.
 func rootfsPath() string {
 	if p := os.Getenv("HOCKER_ROOTFS"); p != "" {
 		return p
