@@ -38,6 +38,13 @@ func child(args []string) {
 	must(syscall.Chroot(rootfsPath()))
 	must(os.Chdir("/"))
 
+	// Mount a fresh procfs so tools like `ps` see only the container's
+	// processes and /proc reflects the new PID namespace. The rootfs must
+	// contain an empty /proc directory for this to land. Because the mount
+	// namespace is private, the kernel tears this down when the process exits.
+	must(syscall.Mount("proc", "/proc", "proc", 0, ""))
+	defer syscall.Unmount("/proc", 0)
+
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
