@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Fast checks that run anywhere: the code builds, vets clean, and still
+  # cross-compiles for the platforms hocker claims to support.
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go build ./...
+      - run: go vet ./...
+      - name: cross-compile
+        run: |
+          GOOS=linux GOARCH=arm64 go build -o /dev/null .
+          GOOS=darwin GOARCH=arm64 go build -o /dev/null .
+
+  # The real test: build the binary and the test binary, then run the
+  # integration suite as root. The Ubuntu runner has cgroup v2, user
+  # namespaces, iproute2, and iptables, which is everything hocker needs. The
+  # suite downloads a small Alpine rootfs itself.
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: build hocker and the test binary
+        run: |
+          go build -o hocker .
+          go test -c -o hocker.test .
+      - name: run integration tests as root
+        run: sudo env "HOCKER_BIN=$PWD/hocker" ./hocker.test -test.v -test.timeout 5m
