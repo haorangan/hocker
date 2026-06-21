@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -37,8 +38,14 @@ func setupCgroupParent(hostPid int) (string, error) {
 		return "", err
 	}
 	// Enable the controllers on the parent so the leaf below inherits them. The
-	// parent itself must stay empty of processes for this to be allowed.
+	// parent itself must stay empty of processes for this to be allowed, so this
+	// can fail if a stale group from an older single-level layout still holds
+	// processes. Verify the controllers actually took, rather than discovering a
+	// missing limit later as a confusing ENOENT on the leaf.
 	_ = os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory +pids"), 0644)
+	if err := requireControllers(parent, "memory", "pids"); err != nil {
+		return "", err
+	}
 
 	leaf := filepath.Join(parent, strconv.Itoa(hostPid))
 	if err := os.MkdirAll(leaf, 0755); err != nil {
@@ -74,6 +81,27 @@ func removeCgroup(dir string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// requireControllers confirms that a cgroup has the named controllers enabled
+// in its subtree_control, so its children will actually expose the matching
+// limit files. It turns "controllers were never delegated to us" into a clear
+// error instead of a later ENOENT when we try to write memory.max.
+func requireControllers(dir string, want ...string) error {
+	data, err := os.ReadFile(filepath.Join(dir, "cgroup.subtree_control"))
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for _, c := range strings.Fields(string(data)) {
+		have[c] = true
+	}
+	for _, c := range want {
+		if !have[c] {
+			return fmt.Errorf("controller %q not delegated to %s (need cgroup v2 with memory and pids enabled)", c, dir)
+		}
+	}
+	return nil
 }
 
 // writeCgroup writes a single cgroup control file. The cgroup v2 "API" is just

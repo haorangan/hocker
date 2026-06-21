@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -126,16 +127,24 @@ func run(args []string) {
 	hostPid := cmd.Process.Pid
 
 	// Apply resource limits from here: the user-namespaced child cannot write
-	// the host cgroup filesystem itself. We add it by its host pid.
+	// the host cgroup filesystem itself. We add it by its host pid. If this
+	// fails we must not let the child run, or it would run with no limits at
+	// all, so we kill it and bail rather than silently dropping containment.
 	leafDir, err := setupCgroupParent(hostPid)
+	defer removeCgroup(leafDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "hocker: cgroup:", err)
+		killChild(cmd)
+		code = 1
+		return
 	}
-	defer removeCgroup(leafDir)
 
 	if net {
 		if err := setupHostNetwork(conf, hostPid); err != nil {
 			fmt.Fprintln(os.Stderr, "hocker: network setup:", err)
+			killChild(cmd)
+			code = 1
+			return
 		}
 	}
 
@@ -145,9 +154,24 @@ func run(args []string) {
 	w.Close()
 
 	if err := cmd.Wait(); err != nil {
-		fmt.Fprintln(os.Stderr, "hocker:", err)
-		code = 1
+		// Propagate the command's own exit status. Only fall back to a generic
+		// failure for signals (e.g. the OOM kill) and for our own setup errors.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() >= 0 {
+			code = ee.ExitCode()
+		} else {
+			fmt.Fprintln(os.Stderr, "hocker:", err)
+			code = 1
+		}
 	}
+}
+
+// killChild kills the container and reaps it, so the deferred cleanups can then
+// remove its cgroup and network. It is used when host-side setup fails and we
+// must not release the child to run unconfined.
+func killChild(cmd *exec.Cmd) {
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
 }
 
 // child runs inside the new namespaces and becomes the container's init process.
@@ -185,7 +209,16 @@ func child(args []string) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	must(cmd.Run())
+	if err := cmd.Run(); err != nil {
+		// Exit with the command's own status so it propagates out through the
+		// parent, rather than collapsing every failure to 1.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() >= 0 {
+			os.Exit(ee.ExitCode())
+		}
+		fmt.Fprintln(os.Stderr, "hocker:", err)
+		os.Exit(1)
+	}
 }
 
 // pivotRoot makes newRoot the process's root filesystem and detaches the old
