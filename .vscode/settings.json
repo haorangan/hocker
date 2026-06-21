@@ -1,0 +1,7 @@
+{
+  "// note": "hocker is a Linux runtime developed on macOS. Point gopls at Linux so the namespace/cgroup code (run_linux.go) type-checks in-editor instead of showing false errors against the host toolchain.",
+  "go.toolsEnvVars": {
+    "GOOS": "linux",
+    "GOARCH": "arm64"
+  }
+}
