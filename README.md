@@ -21,6 +21,8 @@ Given a command, hocker runs it so that the process has the following properties
 - It sees a container image as its root filesystem instead of the host files,
   because hocker uses pivot_root to swap in that image and detach the host root.
 - It has its own /proc, so tools like ps list only the container's processes.
+- It has a minimal /dev with the standard device nodes such as /dev/null and
+  /dev/zero, bound in from the host.
 - It is capped at 100 MiB of memory and 64 processes, enforced by cgroup v2.
 - It is root inside its own user namespace, but that root is mapped to an
   unprivileged user on the host, so a process that is root in the container has
@@ -96,6 +98,10 @@ cat /etc/os-release # shows Alpine, not the host distribution
 
 The memory cap is the most striking one. Ask the container to allocate more than
 its limit and the kernel kills it, while the host is unaffected.
+
+```sh
+tail /dev/zero      # reads zeros into memory forever; killed at the 100 MiB cap
+```
 
 ## Networking
 
@@ -186,5 +192,5 @@ Planned.
 hocker is a learning project, not a production runtime. It does not implement an
 image format, layering, an OCI bundle, or seccomp filtering. It assumes a host
 with cgroup v2 and expects to be run as root, even though the container it
-creates is unprivileged. It does not populate /dev, so the container has no
-device nodes such as /dev/null, and it denies setgroups inside the container.
+creates is unprivileged. Its /dev holds only the standard device nodes rather
+than a full device tree, and it denies setgroups inside the container.

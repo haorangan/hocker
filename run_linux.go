@@ -206,6 +206,12 @@ func child(args []string) {
 	// parked under /.old_root, and only then detach the old root. The flags
 	// match the kernel's locked-mount requirements for an unprivileged mount.
 	must(syscall.Mount("proc", "/proc", "proc", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""))
+
+	// Give the container a working /dev. Like the proc mount, this binds nodes
+	// from the host root while it is still parked under /.old_root, so it runs
+	// before we detach it.
+	must(setupDev())
+
 	must(detachOldRoot())
 
 	cmd := exec.Command(args[0], args[1:]...)

@@ -210,6 +210,30 @@ func TestPidsLimit(t *testing.T) {
 	}
 }
 
+func TestDevNodes(t *testing.T) {
+	requireRoot(t)
+	out, code, _ := runHocker(t, 30*time.Second, "/bin/sh", "-c",
+		`echo hi > /dev/null && echo NULL_OK; `+
+			`head -c 8 /dev/zero | wc -c; `+
+			`head -c 8 /dev/urandom | wc -c; `+
+			`[ -c /dev/null ] && echo IS_CHARDEV; `+
+			`readlink /dev/stdout`)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	for _, want := range []string{"NULL_OK", "IS_CHARDEV", "/proc/self/fd"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output: %q", want, out)
+		}
+	}
+	// /dev/zero and /dev/urandom should each yield the 8 bytes we asked for.
+	if c := strings.Count(out, "      8"); c < 2 { // `wc -c` right-justifies
+		if strings.Count(out, "8") < 2 {
+			t.Errorf("expected two 8-byte reads from /dev/zero and /dev/urandom: %q", out)
+		}
+	}
+}
+
 func TestNetworkGateway(t *testing.T) {
 	requireRoot(t)
 	out, code, _ := runHocker(t,40*time.Second, "--net", "/bin/sh", "-c",
