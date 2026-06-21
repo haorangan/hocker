@@ -59,7 +59,9 @@ func confForSlot(slot int) netConf {
 	}
 }
 
-var vethSlotRe = regexp.MustCompile(`hk(\d+)[hc]`)
+// A hocker veth name is exactly "hk<slot>h" or "hk<slot>c"; the pattern is
+// anchored so it cannot match an unrelated interface or a "@peer" suffix.
+var vethSlotRe = regexp.MustCompile(`^hk(\d+)[hc]$`)
 
 // allocNetSlot reserves a free slot and creates its veth pair, all under an
 // exclusive lock so concurrent containers cannot race onto the same slot. It
@@ -79,9 +81,17 @@ func allocNetSlot() (netConf, error) {
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
-	reapStaleSlots()
+	if err := reapStaleSlots(); err != nil {
+		return netConf{}, err
+	}
 
-	used := usedSlots()
+	// Build the used-set from live kernel links plus reservation files. If we
+	// cannot enumerate the links we refuse to allocate rather than risk handing
+	// out a slot that is already in use.
+	used, err := usedSlots()
+	if err != nil {
+		return netConf{}, err
+	}
 	slot := -1
 	for s := netPoolFirst; s <= netPoolLast; s++ {
 		if !used[s] {
@@ -99,7 +109,7 @@ func allocNetSlot() (netConf, error) {
 	if err := runCmd("ip", "link", "add", conf.hostVeth, "type", "veth", "peer", "name", conf.contVeth); err != nil {
 		return netConf{}, err
 	}
-	if err := os.WriteFile(slotFile(slot), []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+	if err := os.WriteFile(slotFile(slot), []byte(runnerToken()), 0644); err != nil {
 		_ = runCmd("ip", "link", "del", conf.hostVeth)
 		return netConf{}, err
 	}
@@ -165,10 +175,14 @@ func releaseNetSlot(conf netConf) {
 	_ = os.Remove(slotFile(conf.slot))
 }
 
-// reapStaleSlots reclaims slots whose owning process has died, which is how a
-// crashed run cleans itself up on the next allocation. It must be called while
-// holding the allocation lock.
-func reapStaleSlots() {
+// reapStaleSlots reclaims slots left behind by crashed runs, which is how a
+// crash cleans itself up on the next allocation. A reservation whose runner is
+// no longer alive is torn down, and so is any hocker veth that has no
+// reservation at all (a teardown that died after removing the reservation but
+// before deleting the link). It must be called while holding the allocation
+// lock. It returns an error only if it cannot enumerate the live links.
+func reapStaleSlots() error {
+	reserved := map[int]bool{}
 	entries, _ := os.ReadDir(netStateDir)
 	for _, e := range entries {
 		num, ok := strings.CutPrefix(e.Name(), "slot-")
@@ -179,28 +193,50 @@ func reapStaleSlots() {
 		if err != nil {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(netStateDir, e.Name()))
+		token, err := os.ReadFile(filepath.Join(netStateDir, e.Name()))
 		if err != nil {
 			continue
 		}
-		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-		if err != nil || alivePid(pid) {
+		if runnerAlive(strings.TrimSpace(string(token))) {
+			reserved[slot] = true
 			continue
 		}
 		// The runner that held this slot is gone: tear down its leftovers.
-		conf := confForSlot(slot)
-		_ = runCmd("ip", "link", "del", conf.hostVeth)
-		dropNAT(conf)
+		reclaimSlot(slot)
 		_ = os.Remove(filepath.Join(netStateDir, e.Name()))
 	}
+
+	// Reclaim veths that no reservation accounts for.
+	vethSlots, err := existingVethSlots()
+	if err != nil {
+		return err
+	}
+	for _, slot := range vethSlots {
+		if !reserved[slot] {
+			reclaimSlot(slot)
+		}
+	}
+	return nil
+}
+
+// reclaimSlot removes a slot's veth (and its peer) and NAT rule. It is best
+// effort: the link or rule may already be gone.
+func reclaimSlot(slot int) {
+	conf := confForSlot(slot)
+	_ = runCmd("ip", "link", "del", conf.hostVeth)
+	dropNAT(conf)
 }
 
 // usedSlots is the set of slots that are currently taken, drawn from both live
 // kernel state (existing hk<slot> links, which catches leaked veths) and the
 // reservation files. It must be called while holding the allocation lock.
-func usedSlots() map[int]bool {
+func usedSlots() (map[int]bool, error) {
 	used := map[int]bool{}
-	for _, s := range existingVethSlots() {
+	vethSlots, err := existingVethSlots()
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range vethSlots {
 		used[s] = true
 	}
 	entries, _ := os.ReadDir(netStateDir)
@@ -211,23 +247,42 @@ func usedSlots() map[int]bool {
 			}
 		}
 	}
-	return used
+	return used, nil
 }
 
 // existingVethSlots returns the slots of any hocker veth interfaces the kernel
-// currently knows about, so a leaked interface is never allocated over.
-func existingVethSlots() []int {
+// currently knows about, so a leaked interface is never allocated over. It
+// parses the interface name field rather than scanning the whole line, so it
+// cannot be fooled by the "@peer" suffix or an unrelated interface name.
+func existingVethSlots() ([]int, error) {
 	out, err := exec.Command("ip", "-o", "link", "show").CombinedOutput()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ip -o link show: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	var slots []int
-	for _, m := range vethSlotRe.FindAllStringSubmatch(string(out), -1) {
-		if s, err := strconv.Atoi(m[1]); err == nil {
-			slots = append(slots, s)
+	for _, line := range strings.Split(string(out), "\n") {
+		if m := vethSlotRe.FindStringSubmatch(vethNameFromLine(line)); m != nil {
+			if s, err := strconv.Atoi(m[1]); err == nil {
+				slots = append(slots, s)
+			}
 		}
 	}
-	return slots
+	return slots, nil
+}
+
+// vethNameFromLine pulls the interface name out of an `ip -o link show` line
+// such as "7: hk5h@if6: <BROADCAST,...>", stripping the index, the trailing
+// colon, and any "@peer" suffix.
+func vethNameFromLine(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return ""
+	}
+	name := strings.TrimSuffix(fields[1], ":")
+	if i := strings.IndexByte(name, '@'); i >= 0 {
+		name = name[:i]
+	}
+	return name
 }
 
 // dropNAT removes this container's masquerade rule, looping in case a crashed
@@ -239,6 +294,55 @@ func dropNAT(conf netConf) {
 			break
 		}
 	}
+}
+
+// runnerToken identifies the parent process that owns a slot. It is the pid
+// plus the process start time, so a recycled pid (a different process that
+// happens to reuse the number) is not mistaken for the original runner.
+func runnerToken() string {
+	return fmt.Sprintf("%d %d", os.Getpid(), procStarttime(os.Getpid()))
+}
+
+// runnerAlive reports whether the runner recorded in a reservation token is
+// still the live process that wrote it: the pid must be alive and, when a start
+// time is recorded, it must still match.
+func runnerAlive(token string) bool {
+	fields := strings.Fields(token)
+	if len(fields) == 0 {
+		return false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || !alivePid(pid) {
+		return false
+	}
+	if len(fields) >= 2 {
+		want, _ := strconv.ParseInt(fields[1], 10, 64)
+		if want != 0 && procStarttime(pid) != want {
+			return false
+		}
+	}
+	return true
+}
+
+// procStarttime reads field 22 of /proc/<pid>/stat, the process start time in
+// clock ticks since boot. It returns 0 if unavailable. The comm field (field 2)
+// can contain spaces and parentheses, so we parse after the last ')'.
+func procStarttime(pid int) int64 {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return 0
+	}
+	fields := strings.Fields(s[i+1:]) // fields[0] is field 3 (state)
+	if len(fields) < 20 {             // starttime is field 22, i.e. fields[19]
+		return 0
+	}
+	st, _ := strconv.ParseInt(fields[19], 10, 64)
+	return st
 }
 
 func alivePid(pid int) bool {

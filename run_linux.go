@@ -72,8 +72,11 @@ func run(args []string) {
 			return
 		}
 		slot = conf.slot
-		defer teardownHostNetwork(conf)
+		// Registered so teardown runs first and the reservation is released
+		// last: if we are killed mid-teardown, a stale reservation remains for
+		// the reaper to reclaim, rather than a veth with no reservation.
 		defer releaseNetSlot(conf)
+		defer teardownHostNetwork(conf)
 	}
 
 	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, args...)...)
