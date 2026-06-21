@@ -37,6 +37,8 @@ func setupCgroupParent(hostPid int) (string, error) {
 	if err := os.MkdirAll(parent, 0755); err != nil {
 		return "", err
 	}
+	reapStaleCgroups(parent) // remove empty leaf groups left by crashed runs
+
 	// Enable the controllers on the parent so the leaf below inherits them. The
 	// parent itself must stay empty of processes for this to be allowed, so this
 	// can fail if a stale group from an older single-level layout still holds
@@ -80,6 +82,25 @@ func removeCgroup(dir string) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// reapStaleCgroups removes per-container leaf groups whose process is gone,
+// which a crashed run would otherwise leave behind. The leaves are named by
+// host pid; an empty one for a dead pid is removable, and a leaf owned by a
+// live process is left alone. rmdir only succeeds when the group is empty, so a
+// still-draining group is skipped harmlessly.
+func reapStaleCgroups(parent string) {
+	entries, _ := os.ReadDir(parent)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || alivePid(pid) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(parent, e.Name()))
 	}
 }
 

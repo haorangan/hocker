@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -28,16 +30,30 @@ func prepareRootfs(src string) (string, error) {
 	if fi, err := os.Stat(src); err != nil || !fi.IsDir() {
 		return "", fmt.Errorf("%q is not a directory; unpack an image into it first", src)
 	}
+	// Refuse to copy the host root itself, directly or through a symlink, which
+	// would otherwise duplicate the whole machine and chown it.
+	abs, err := filepath.Abs(src)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	if filepath.Clean(abs) == "/" {
+		return "", fmt.Errorf("refusing to use the host root %q as a rootfs", abs)
+	}
+
 	if err := os.MkdirAll(rootfsRunDir, 0755); err != nil {
 		return "", err
 	}
+	reapStaleRootfs() // clear copies left by crashed runs before adding ours
 
 	dst := filepath.Join(rootfsRunDir, fmt.Sprintf("rootfs-%d", os.Getpid()))
 	if err := os.RemoveAll(dst); err != nil {
 		return "", err
 	}
 	// cp -aT copies src as dst, preserving permissions, symlinks, and times.
-	if err := runCmd("cp", "-aT", src, dst); err != nil {
+	if err := runCmd("cp", "-aT", abs, dst); err != nil {
 		return "", err
 	}
 	if err := chownTree(dst); err != nil {
@@ -45,6 +61,27 @@ func prepareRootfs(src string) (string, error) {
 		return "", err
 	}
 	return dst, nil
+}
+
+// reapStaleRootfs removes per-run image copies whose creating process is gone,
+// so a crashed run does not leak its copy onto disk forever. A copy owned by a
+// live process is never touched, so this is safe to run concurrently.
+func reapStaleRootfs() {
+	entries, _ := os.ReadDir(rootfsRunDir)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		num, ok := strings.CutPrefix(e.Name(), "rootfs-")
+		if !ok {
+			continue
+		}
+		pid, err := strconv.Atoi(num)
+		if err != nil || alivePid(pid) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(rootfsRunDir, e.Name()))
+	}
 }
 
 // chownTree shifts every inode under root into the container's mapped id range:
@@ -65,8 +102,16 @@ func chownTree(root string) error {
 		if !ok {
 			return fmt.Errorf("cannot read ownership of %s", path)
 		}
-		uid := subuidBase + int(st.Uid)%subuidSize
-		gid := subuidBase + int(st.Gid)%subuidSize
-		return os.Lchown(path, uid, gid)
+		return os.Lchown(path, shiftID(st.Uid), shiftID(st.Gid))
 	})
+}
+
+// shiftID maps an image owner id into the container's mapped range. Ids beyond
+// the mapped width have no place in the namespace, so they collapse to the
+// overflow id (nobody) rather than wrapping around onto a real container id.
+func shiftID(id uint32) int {
+	if id >= subuidSize {
+		id = 65534
+	}
+	return subuidBase + int(id)
 }
