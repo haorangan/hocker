@@ -32,11 +32,27 @@ func run(args []string) {
 func child(args []string) {
 	must(syscall.Sethostname([]byte("hocker")))
 
+	// Swap the root filesystem so the process sees the container image as "/"
+	// instead of the host's files. chroot is the simple form; pivot_root is the
+	// more correct one and is a planned upgrade.
+	must(syscall.Chroot(rootfsPath()))
+	must(os.Chdir("/"))
+
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	must(cmd.Run())
+}
+
+// rootfsPath returns the directory to use as the container's root filesystem.
+// Override it with HOCKER_ROOTFS; it defaults to ./rootfs (an unpacked image,
+// e.g. an Alpine mini root fs or `docker export`ed container).
+func rootfsPath() string {
+	if p := os.Getenv("HOCKER_ROOTFS"); p != "" {
+		return p
+	}
+	return "rootfs"
 }
 
 func must(err error) {
