@@ -1,0 +1,47 @@
+//go:build linux
+
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"syscall"
+)
+
+// run is the user-facing entrypoint. There is no "create a container" syscall;
+// a container is just a process started with the right isolation flags. We
+// re-execute hocker itself as the hidden "child" command inside a fresh set of
+// namespaces, because we cannot safely apply these flags to the already-running
+// Go runtime — the clean trick is to hand them to a brand new process.
+func run(args []string) {
+	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, args...)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUTS | // own hostname
+			syscall.CLONE_NEWPID | // own PID number space (child sees itself as PID 1)
+			syscall.CLONE_NEWNS, // own mount table
+		Unshareflags: syscall.CLONE_NEWNS, // keep our mounts from propagating back to the host
+	}
+	must(cmd.Run())
+}
+
+// child runs inside the new namespaces and becomes the container's init process.
+func child(args []string) {
+	must(syscall.Sethostname([]byte("hocker")))
+
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	must(cmd.Run())
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hocker:", err)
+		os.Exit(1)
+	}
+}

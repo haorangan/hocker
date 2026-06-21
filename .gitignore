@@ -1,0 +1,6 @@
+# build output
+/hocker
+/hocker-linux
+
+# unpacked container root filesystems used for local testing
+/rootfs/
