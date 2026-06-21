@@ -1,5 +1,7 @@
 # hocker
 
+[![ci](https://github.com/haorangan/hocker/actions/workflows/ci.yml/badge.svg)](https://github.com/haorangan/hocker/actions/workflows/ci.yml)
+
 A tiny container runtime written in Go. It runs a command inside its own Linux
 namespaces and cgroups, which are the same kernel features Docker is built on.
 
