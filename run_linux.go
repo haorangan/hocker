@@ -32,6 +32,9 @@ func run(args []string) {
 func child(args []string) {
 	must(syscall.Sethostname([]byte("hocker")))
 
+	// Apply resource limits before chroot, while /sys/fs/cgroup is still reachable.
+	setupCgroup()
+
 	// Swap the root filesystem so the process sees the container image as "/"
 	// instead of the host's files. chroot is the simple form; pivot_root is the
 	// more correct one and is a planned upgrade.
