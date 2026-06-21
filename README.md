@@ -76,6 +76,30 @@ cat /etc/os-release # shows Alpine, not the host distribution
 The memory cap is the most striking one. Ask the container to allocate more than
 its limit and the kernel kills it, while the host is unaffected.
 
+## Networking
+
+By default the container has no network beyond loopback, which is the point of a
+network namespace: it starts empty. Pass --net to give it a real one.
+
+```sh
+sudo ./hocker run --net /bin/sh
+# inside the container:
+ip addr             # shows eth0 with 10.10.0.2
+ping 10.10.0.1      # reaches the host end of the link
+ping 8.8.8.8        # reaches the internet through NAT
+```
+
+hocker builds a veth pair, which is a virtual cable with two ends. One end stays
+on the host as the gateway at 10.10.0.1, and the other is moved into the
+container as eth0 at 10.10.0.2. A NAT masquerade rule then lets the container's
+traffic leave the machine. The host cannot set up the container end until the
+container's network namespace exists, so the two sides coordinate over a pipe:
+the container waits until the host signals that the interface is in place.
+
+This needs iproute2 and iptables on the host. To resolve names rather than raw
+IP addresses, put a nameserver such as `nameserver 8.8.8.8` in the rootfs at
+/etc/resolv.conf.
+
 ## How it works
 
 There is no system call that creates a container. hocker builds one out of
@@ -102,13 +126,16 @@ Working today.
 - pivot_root into a container root filesystem, with the host root detached.
 - A private /proc mount.
 - cgroup v2 memory and PID limits.
+- Network isolation with a veth pair and NAT behind --net, so the container has
+  its own network and can still reach the internet. This needs iproute2 and
+  iptables on the host.
+- A helper that downloads and unpacks an Alpine root filesystem.
 
 Planned.
 
-- Network isolation with a veth pair and NAT, so the container has its own
-  network and can still reach the internet.
 - A user namespace, so root inside the container is not root on the host.
-- A small helper that unpacks an image into ./rootfs for you.
+- Per-container interface names and subnets, so more than one networked
+  container can run at the same time.
 
 ## Limitations
 

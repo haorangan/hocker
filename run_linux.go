@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,21 +17,73 @@ import (
 // namespaces, because we cannot safely apply these flags to the already-running
 // Go runtime. The clean trick is to hand them to a brand new process.
 func run(args []string) {
+	net := false
+	if len(args) > 0 && args[0] == "--net" {
+		net, args = true, args[1:]
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "hocker run: need a command, e.g. `hocker run /bin/sh`")
+		os.Exit(1)
+	}
+
 	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, args...)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	cloneFlags := syscall.CLONE_NEWUTS | // own hostname
+		syscall.CLONE_NEWPID | // own PID number space (child sees itself as PID 1)
+		syscall.CLONE_NEWNS // own mount table
+	if net {
+		cloneFlags |= syscall.CLONE_NEWNET // own network stack
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS | // own hostname
-			syscall.CLONE_NEWPID | // own PID number space (child sees itself as PID 1)
-			syscall.CLONE_NEWNS, // own mount table
+		Cloneflags:   uintptr(cloneFlags),
 		Unshareflags: syscall.CLONE_NEWNS, // keep our mounts from propagating back to the host
 	}
-	must(cmd.Run())
+
+	// With networking on, the host must move a veth interface into the child's
+	// network namespace before the child can configure it. We hand the child
+	// the read end of a pipe and make it wait until we close the write end,
+	// which signals that the interface is in place.
+	var ready *os.File
+	if net {
+		r, w, err := os.Pipe()
+		must(err)
+		cmd.ExtraFiles = []*os.File{r} // the child sees this as fd 3
+		cmd.Env = append(os.Environ(), "HOCKER_NET=1")
+		ready = w
+		defer r.Close()
+	}
+
+	must(cmd.Start())
+
+	if net {
+		if err := setupHostNetwork(cmd.Process.Pid); err != nil {
+			fmt.Fprintln(os.Stderr, "hocker: network setup:", err)
+		}
+		ready.Close() // release the child now that its interface exists
+		defer teardownHostNetwork()
+	}
+
+	if err := cmd.Wait(); err != nil {
+		fmt.Fprintln(os.Stderr, "hocker:", err)
+		os.Exit(1)
+	}
 }
 
 // child runs inside the new namespaces and becomes the container's init process.
 func child(args []string) {
+	// If networking is enabled, wait for the host to place our veth interface,
+	// then configure it. This runs before pivot_root so the host's `ip` binary
+	// is still reachable.
+	if os.Getenv("HOCKER_NET") == "1" {
+		waitForHostNetwork()
+		if err := setupContainerNetwork(); err != nil {
+			fmt.Fprintln(os.Stderr, "hocker: container network:", err)
+		}
+	}
+
 	must(syscall.Sethostname([]byte("hocker")))
 
 	// Apply resource limits before chroot, while /sys/fs/cgroup is still reachable.
@@ -89,6 +142,17 @@ func pivotRoot(newRoot string) error {
 		return fmt.Errorf("unmount old root: %w", err)
 	}
 	return os.Remove(parkedOldRoot)
+}
+
+// waitForHostNetwork blocks until the parent closes the sync pipe (fd 3), which
+// signals that the host has moved our veth interface into this namespace.
+func waitForHostNetwork() {
+	sync := os.NewFile(3, "hocker-net-ready")
+	if sync == nil {
+		return
+	}
+	io.Copy(io.Discard, sync) // returns once the parent closes the write end
+	sync.Close()
 }
 
 // rootfsPath returns the directory to use as the container's root filesystem.

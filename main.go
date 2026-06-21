@@ -5,13 +5,14 @@ import (
 	"os"
 )
 
-const usage = `hocker — a tiny container runtime in Go
+const usage = `hocker, a tiny container runtime in Go
 
 Usage:
-  hocker run <command> [args...]
+  hocker run [--net] <command> [args...]
 
 hocker isolates a command using Linux namespaces and cgroups, the same kernel
-primitives Docker is built on. It only runs on Linux.
+primitives Docker is built on. With --net it also gives the container its own
+network with internet access. It only runs on Linux.
 `
 
 func main() {
