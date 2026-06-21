@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 )
 
@@ -13,7 +14,7 @@ import (
 // a container is just a process started with the right isolation flags. We
 // re-execute hocker itself as the hidden "child" command inside a fresh set of
 // namespaces, because we cannot safely apply these flags to the already-running
-// Go runtime — the clean trick is to hand them to a brand new process.
+// Go runtime. The clean trick is to hand them to a brand new process.
 func run(args []string) {
 	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, args...)...)
 	cmd.Stdin = os.Stdin
@@ -36,10 +37,9 @@ func child(args []string) {
 	setupCgroup()
 
 	// Swap the root filesystem so the process sees the container image as "/"
-	// instead of the host's files. chroot is the simple form; pivot_root is the
-	// more correct one and is a planned upgrade.
-	must(syscall.Chroot(rootfsPath()))
-	must(os.Chdir("/"))
+	// instead of the host's files. pivot_root actually moves the mount and lets
+	// us detach the host's root afterwards, which chroot cannot do.
+	must(pivotRoot(rootfsPath()))
 
 	// Mount a fresh procfs so tools like `ps` see only the container's
 	// processes and /proc reflects the new PID namespace. The rootfs must
@@ -53,6 +53,42 @@ func child(args []string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	must(cmd.Run())
+}
+
+// pivotRoot makes newRoot the process's root filesystem and detaches the old
+// one. chroot only changes the apparent root and can be escaped; pivot_root
+// moves the mount and lets us unmount the host's root so the container cannot
+// reach it at all.
+func pivotRoot(newRoot string) error {
+	// Keep mount changes from propagating back to the host.
+	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make / private: %w", err)
+	}
+
+	// pivot_root requires newRoot to be a mount point, so bind mount it onto itself.
+	if err := syscall.Mount(newRoot, newRoot, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("bind mount rootfs: %w", err)
+	}
+
+	// A place to park the old root until we can detach it.
+	oldRoot := filepath.Join(newRoot, ".old_root")
+	if err := os.MkdirAll(oldRoot, 0700); err != nil {
+		return err
+	}
+
+	if err := syscall.PivotRoot(newRoot, oldRoot); err != nil {
+		return fmt.Errorf("pivot_root: %w", err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		return err
+	}
+
+	// Detach the old root and remove the now-empty mount point.
+	const parkedOldRoot = "/.old_root"
+	if err := syscall.Unmount(parkedOldRoot, syscall.MNT_DETACH); err != nil {
+		return fmt.Errorf("unmount old root: %w", err)
+	}
+	return os.Remove(parkedOldRoot)
 }
 
 // rootfsPath returns the directory to use as the container's root filesystem.

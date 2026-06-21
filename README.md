@@ -17,7 +17,7 @@ Given a command, hocker runs it so that the process has the following properties
 - It has its own hostname, because it runs in a new UTS namespace.
 - It has its own mount table, because it runs in a new mount namespace.
 - It sees a container image as its root filesystem instead of the host files,
-  because hocker chroots into that image.
+  because hocker uses pivot_root to swap in that image and detach the host root.
 - It has its own /proc, so tools like ps list only the container's processes.
 - It is capped at 100 MiB of memory and 64 processes, enforced by cgroup v2.
 
@@ -86,8 +86,8 @@ three ordinary mechanisms.
    applied to this brand new process rather than to the running Go program,
    because that is the clean way to enter fresh namespaces.
 2. The `child` process lands inside those namespaces and becomes the container's
-   init. It sets the hostname, applies cgroup limits, chroots into the image,
-   and mounts a fresh /proc.
+   init. It sets the hostname, applies cgroup limits, swaps in the image as its
+   root with pivot_root, and mounts a fresh /proc.
 3. The `child` then replaces itself with the requested command, which inherits
    all of the isolation set up around it.
 
@@ -99,13 +99,12 @@ been swapped the host's /sys/fs/cgroup is no longer reachable.
 Working today.
 
 - New UTS, PID, and mount namespaces.
-- chroot into a container root filesystem.
+- pivot_root into a container root filesystem, with the host root detached.
 - A private /proc mount.
 - cgroup v2 memory and PID limits.
 
 Planned.
 
-- pivot_root in place of chroot, which is the more correct way to swap roots.
 - Network isolation with a veth pair and NAT, so the container has its own
   network and can still reach the internet.
 - A user namespace, so root inside the container is not root on the host.
