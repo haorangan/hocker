@@ -128,7 +128,8 @@ slot. A slot is a number from 1 to 254 that picks the veth names and a private
 subnet 10.10.slot.0/24, with the gateway at .1 and the container at .2. The
 first container takes slot 1, the next takes slot 2, and so on. Slots are handed
 out under a file lock, and a slot whose container has exited is reclaimed on the
-next run, so a crash never strands a subnet.
+next run, so a crash never strands a subnet. Running `hocker gc` reclaims such
+leftovers on demand.
 
 This needs iproute2 and iptables on the host. To resolve names rather than raw
 IP addresses, put a nameserver such as `nameserver 8.8.8.8` in the rootfs at
@@ -168,7 +169,8 @@ Working today.
 
 - New UTS, PID, and mount namespaces.
 - pivot_root into a container root filesystem, with the host root detached.
-- A private /proc mount.
+- A private /proc mount and a minimal /dev with the standard device nodes, a
+  private devpts for pseudo-terminals, and /dev/shm.
 - cgroup v2 memory and PID limits, set up by the real-root parent because the
   user-namespaced child cannot write the host cgroup filesystem.
 - A user namespace, so root inside the container maps to an unprivileged host
@@ -179,13 +181,15 @@ Working today.
   its own network and can still reach the internet. This needs iproute2 and
   iptables on the host.
 - A helper that downloads and unpacks an Alpine root filesystem.
+- A `gc` command that reclaims leaked veths, cgroups, and image copies from runs
+  that were killed before they could clean up, without waiting for the next run.
 
 Planned.
 
 - Per-container host id ranges, so containers cannot see each other's files even
   through the host, rather than the single shared mapped range used today.
-- A `gc` command to sweep leaked veths and cgroups without waiting for the next
-  run to reclaim them.
+- An image format and pull, so hocker can run a published image rather than a
+  pre-unpacked root filesystem.
 
 ## Limitations
 

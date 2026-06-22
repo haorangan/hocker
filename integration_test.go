@@ -131,7 +131,7 @@ func runHocker(t *testing.T, timeout time.Duration, args ...string) (string, int
 
 func TestUserNamespace(t *testing.T) {
 	requireRoot(t)
-	out, code, _ := runHocker(t,30*time.Second, "/bin/sh", "-c", "id -u; cat /proc/self/uid_map")
+	out, code, _ := runHocker(t, 30*time.Second, "/bin/sh", "-c", "id -u; cat /proc/self/uid_map")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, out)
 	}
@@ -147,7 +147,7 @@ func TestUserNamespace(t *testing.T) {
 
 func TestHostnameIsolation(t *testing.T) {
 	requireRoot(t)
-	out, code, _ := runHocker(t,30*time.Second, "/bin/sh", "-c", "hostname")
+	out, code, _ := runHocker(t, 30*time.Second, "/bin/sh", "-c", "hostname")
 	if code != 0 || strings.TrimSpace(out) != "hocker" {
 		t.Errorf("expected hostname hocker, got exit %d: %q", code, out)
 	}
@@ -156,7 +156,7 @@ func TestHostnameIsolation(t *testing.T) {
 func TestFilesystemIsolation(t *testing.T) {
 	requireRoot(t)
 	// The image, not the host distro, and no host-only paths leak in.
-	out, code, _ := runHocker(t,30*time.Second, "/bin/sh", "-c",
+	out, code, _ := runHocker(t, 30*time.Second, "/bin/sh", "-c",
 		"cat /etc/os-release; [ -e /var/lib/hocker ] && echo HOST_LEAK || echo ISOLATED")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, out)
@@ -172,7 +172,7 @@ func TestFilesystemIsolation(t *testing.T) {
 func TestExitCodePropagation(t *testing.T) {
 	requireRoot(t)
 	for _, want := range []int{0, 42} {
-		_, code, _ := runHocker(t,30*time.Second, "/bin/sh", "-c", fmt.Sprintf("exit %d", want))
+		_, code, _ := runHocker(t, 30*time.Second, "/bin/sh", "-c", fmt.Sprintf("exit %d", want))
 		if code != want {
 			t.Errorf("exit code: want %d, got %d", want, code)
 		}
@@ -183,7 +183,7 @@ func TestMemoryLimit(t *testing.T) {
 	requireRoot(t)
 	// Allocate without bound; the cgroup memory cap must have the kernel kill
 	// it. If the cap were not enforced this would run until the timeout.
-	out, code, timedOut := runHocker(t,30*time.Second, "/bin/sh", "-c",
+	out, code, timedOut := runHocker(t, 30*time.Second, "/bin/sh", "-c",
 		"A=x; while :; do A=$A$A$A$A; done")
 	if timedOut {
 		t.Fatalf("allocator was not killed; memory cap not enforced: %s", out)
@@ -197,7 +197,7 @@ func TestPidsLimit(t *testing.T) {
 	requireRoot(t)
 	// Far more background processes than the 64-process cap; the cgroup must
 	// refuse the excess forks rather than letting them all start.
-	out, code, timedOut := runHocker(t,30*time.Second, "/bin/sh", "-c",
+	out, code, timedOut := runHocker(t, 30*time.Second, "/bin/sh", "-c",
 		"n=0; i=0; while [ $i -lt 300 ]; do (sleep 5 &) 2>/dev/null && n=$((n+1)); i=$((i+1)); done; echo done")
 	if timedOut {
 		t.Fatalf("pids test timed out: %s", out)
@@ -234,9 +234,67 @@ func TestDevNodes(t *testing.T) {
 	}
 }
 
+func TestDevPts(t *testing.T) {
+	requireRoot(t)
+	out, code, _ := runHocker(t, 30*time.Second, "/bin/sh", "-c",
+		`[ -e /dev/ptmx ] && echo PTMX_OK; [ -d /dev/pts ] && echo PTS_OK; [ -d /dev/shm ] && echo SHM_OK`)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	for _, want := range []string{"PTMX_OK", "PTS_OK", "SHM_OK"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output: %q", want, out)
+		}
+	}
+}
+
+func TestGc(t *testing.T) {
+	requireRoot(t)
+	// Seed leftovers a crashed run would leave: a veth + stale reservation
+	// (dead pid), an orphan veth, a stale rootfs copy, and a stale cgroup leaf.
+	const deadPid = "999999"
+	mustCmd(t, "ip", "link", "add", "hk250h", "type", "veth", "peer", "name", "hk250c")
+	mustCmd(t, "ip", "link", "add", "hk251h", "type", "veth", "peer", "name", "hk251c")
+	os.MkdirAll(netStateDir, 0755)
+	os.WriteFile(slotFile(250), []byte(deadPid), 0644)
+	os.MkdirAll(rootfsRunDir, 0755)
+	os.MkdirAll(rootfsRunDir+"/rootfs-"+deadPid, 0755)
+	os.MkdirAll(cgroupRoot+"/"+cgroupName+"/"+deadPid, 0755)
+
+	out, err := exec.Command(hockerBin, "gc").CombinedOutput()
+	if err != nil {
+		t.Fatalf("gc: %v\n%s", err, out)
+	}
+	t.Logf("gc output: %s", out)
+
+	// Everything seeded should be gone.
+	links, _ := exec.Command("ip", "-o", "link", "show").CombinedOutput()
+	for _, line := range strings.Split(string(links), "\n") {
+		if n := vethNameFromLine(line); n == "hk250h" || n == "hk251h" {
+			t.Errorf("gc left veth %s", n)
+		}
+	}
+	if _, err := os.Stat(slotFile(250)); err == nil {
+		t.Error("gc left slot reservation slot-250")
+	}
+	if _, err := os.Stat(rootfsRunDir + "/rootfs-" + deadPid); err == nil {
+		t.Error("gc left rootfs copy rootfs-" + deadPid)
+	}
+	if _, err := os.Stat(cgroupRoot + "/" + cgroupName + "/" + deadPid); err == nil {
+		t.Error("gc left cgroup leaf " + deadPid)
+	}
+}
+
+func mustCmd(t *testing.T, name string, args ...string) {
+	t.Helper()
+	if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	}
+}
+
 func TestNetworkGateway(t *testing.T) {
 	requireRoot(t)
-	out, code, _ := runHocker(t,40*time.Second, "--net", "/bin/sh", "-c",
+	out, code, _ := runHocker(t, 40*time.Second, "--net", "/bin/sh", "-c",
 		`ip -4 addr show eth0 | awk '/inet /{print "ip="$2}'; `+
 			`gw=$(ip route | awk '/default/{print $3}'); `+
 			`ping -c1 -W2 "$gw" >/dev/null 2>&1 && echo PING_OK || echo PING_FAIL`)
@@ -260,7 +318,7 @@ func TestConcurrentNetworkDistinctSubnets(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out, code, _ := runHocker(t,40*time.Second, "--net", "/bin/sh", "-c",
+			out, code, _ := runHocker(t, 40*time.Second, "--net", "/bin/sh", "-c",
 				`ip -4 addr show eth0 | awk '/inet /{print $2}'; sleep 3`)
 			if code != 0 {
 				t.Errorf("container %d failed: %s", i, out)
@@ -285,7 +343,7 @@ func TestConcurrentNetworkDistinctSubnets(t *testing.T) {
 
 func TestNetworkCleanup(t *testing.T) {
 	requireRoot(t)
-	if _, code, _ := runHocker(t,40*time.Second, "--net", "/bin/sh", "-c", "true"); code != 0 {
+	if _, code, _ := runHocker(t, 40*time.Second, "--net", "/bin/sh", "-c", "true"); code != 0 {
 		t.Fatalf("networked run failed with exit %d", code)
 	}
 	// No hocker veth and no slot reservation should remain.

@@ -44,6 +44,25 @@ func setupDev() error {
 			fmt.Fprintf(os.Stderr, "hocker: skipping /dev/%s: %v\n", name, err)
 		}
 	}
+
+	// A private devpts instance plus /dev/ptmx, so the container can allocate
+	// its own pseudo-terminals (anything that opens a new pty: login shells,
+	// script, tmux). newinstance keeps these ptys isolated from the host's.
+	if err := os.Mkdir("/dev/pts", 0755); err == nil {
+		if err := syscall.Mount("devpts", "/dev/pts", "devpts", syscall.MS_NOSUID|syscall.MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620"); err != nil {
+			fmt.Fprintf(os.Stderr, "hocker: /dev/pts: %v\n", err)
+		} else if err := os.Symlink("pts/ptmx", "/dev/ptmx"); err != nil {
+			fmt.Fprintf(os.Stderr, "hocker: /dev/ptmx: %v\n", err)
+		}
+	}
+
+	// A small tmpfs for /dev/shm, which many programs expect for shared memory.
+	if err := os.Mkdir("/dev/shm", 0777); err == nil {
+		if err := syscall.Mount("shm", "/dev/shm", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, "mode=1777"); err != nil {
+			fmt.Fprintf(os.Stderr, "hocker: /dev/shm: %v\n", err)
+		}
+	}
+
 	for link, target := range devSymlinks {
 		if err := os.Symlink(target, link); err != nil {
 			return fmt.Errorf("symlink %s: %w", link, err)

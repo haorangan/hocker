@@ -8,7 +8,8 @@ import (
 const usage = `hocker, a tiny container runtime in Go
 
 Usage:
-  hocker run [--net] <command> [args...]
+  hocker run [--net] <command> [args...]   run a command in a new container
+  hocker gc                                reclaim leftovers from crashed runs
 
 hocker isolates a command using Linux namespaces and cgroups, the same kernel
 primitives Docker is built on. With --net it also gives the container its own
@@ -28,6 +29,8 @@ func main() {
 			os.Exit(1)
 		}
 		run(os.Args[2:])
+	case "gc":
+		gc(os.Args[2:])
 	case "child":
 		// Internal: the re-executed self that lands inside the new namespaces.
 		// Not meant to be called directly by users.

@@ -26,9 +26,9 @@ import (
 // 10.10.0.0/16, so two containers never collide. Slots are handed out under a
 // file lock, and a reaper reclaims slots whose owning process has died.
 const (
-	contIface    = "eth0"          // container end after it is renamed
-	netPoolFirst = 1               // slot 0 is reserved; keeps the third octet a clean byte
-	netPoolLast  = 254             // 254 simultaneous networked containers
+	contIface    = "eth0" // container end after it is renamed
+	netPoolFirst = 1      // slot 0 is reserved; keeps the third octet a clean byte
+	netPoolLast  = 254    // 254 simultaneous networked containers
 	netStateDir  = "/run/hocker/net"
 )
 
@@ -63,57 +63,78 @@ func confForSlot(slot int) netConf {
 // anchored so it cannot match an unrelated interface or a "@peer" suffix.
 var vethSlotRe = regexp.MustCompile(`^hk(\d+)[hc]$`)
 
-// allocNetSlot reserves a free slot and creates its veth pair, all under an
-// exclusive lock so concurrent containers cannot race onto the same slot. It
-// records the reservation against this process (the parent that will tear it
-// down), and first reaps any slots left behind by crashed runs.
-func allocNetSlot() (netConf, error) {
+// withNetLock runs fn while holding an exclusive lock over the network state
+// directory, so slot allocation and reclamation never race each other.
+func withNetLock(fn func() error) error {
 	if err := os.MkdirAll(netStateDir, 0755); err != nil {
-		return netConf{}, err
+		return err
 	}
 	lock, err := os.OpenFile(filepath.Join(netStateDir, "lock"), os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return netConf{}, err
+		return err
 	}
 	defer lock.Close()
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return netConf{}, err
+		return err
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn()
+}
 
-	if err := reapStaleSlots(); err != nil {
-		return netConf{}, err
-	}
-
-	// Build the used-set from live kernel links plus reservation files. If we
-	// cannot enumerate the links we refuse to allocate rather than risk handing
-	// out a slot that is already in use.
-	used, err := usedSlots()
-	if err != nil {
-		return netConf{}, err
-	}
-	slot := -1
-	for s := netPoolFirst; s <= netPoolLast; s++ {
-		if !used[s] {
-			slot = s
-			break
+// allocNetSlot reserves a free slot and creates its veth pair under the lock so
+// concurrent containers cannot race onto the same slot. It records the
+// reservation against this process (the parent that will tear it down), and
+// first reaps any slots left behind by crashed runs.
+func allocNetSlot() (netConf, error) {
+	var conf netConf
+	err := withNetLock(func() error {
+		if _, err := reapStaleSlots(); err != nil {
+			return err
 		}
-	}
-	if slot < 0 {
-		return netConf{}, fmt.Errorf("no free container subnet (%d in use)", netPoolLast)
-	}
 
-	conf := confForSlot(slot)
-	// Claim the slot by creating the pair while still holding the lock, so a
-	// concurrent allocator sees the link and counts the slot as used.
-	if err := runCmd("ip", "link", "add", conf.hostVeth, "type", "veth", "peer", "name", conf.contVeth); err != nil {
-		return netConf{}, err
-	}
-	if err := os.WriteFile(slotFile(slot), []byte(runnerToken()), 0644); err != nil {
-		_ = runCmd("ip", "link", "del", conf.hostVeth)
-		return netConf{}, err
-	}
-	return conf, nil
+		// Build the used-set from live kernel links plus reservation files. If
+		// we cannot enumerate the links we refuse to allocate rather than risk
+		// handing out a slot that is already in use.
+		used, err := usedSlots()
+		if err != nil {
+			return err
+		}
+		slot := -1
+		for s := netPoolFirst; s <= netPoolLast; s++ {
+			if !used[s] {
+				slot = s
+				break
+			}
+		}
+		if slot < 0 {
+			return fmt.Errorf("no free container subnet (%d in use)", netPoolLast)
+		}
+
+		conf = confForSlot(slot)
+		// Claim the slot by creating the pair while still holding the lock, so a
+		// concurrent allocator sees the link and counts the slot as used.
+		if err := runCmd("ip", "link", "add", conf.hostVeth, "type", "veth", "peer", "name", conf.contVeth); err != nil {
+			return err
+		}
+		if err := os.WriteFile(slotFile(slot), []byte(runnerToken()), 0644); err != nil {
+			_ = runCmd("ip", "link", "del", conf.hostVeth)
+			return err
+		}
+		return nil
+	})
+	return conf, err
+}
+
+// gcNetwork reclaims leaked slots on demand, outside of any container run. It
+// returns the number of slots reclaimed.
+func gcNetwork() (int, error) {
+	var n int
+	err := withNetLock(func() error {
+		var err error
+		n, err = reapStaleSlots()
+		return err
+	})
+	return n, err
 }
 
 // setupHostNetwork runs in the host network namespace. The veth pair already
@@ -180,8 +201,10 @@ func releaseNetSlot(conf netConf) {
 // no longer alive is torn down, and so is any hocker veth that has no
 // reservation at all (a teardown that died after removing the reservation but
 // before deleting the link). It must be called while holding the allocation
-// lock. It returns an error only if it cannot enumerate the live links.
-func reapStaleSlots() error {
+// lock. It returns the number of slots reclaimed, and an error only if it
+// cannot enumerate the live links.
+func reapStaleSlots() (int, error) {
+	reclaimed := 0
 	reserved := map[int]bool{}
 	entries, _ := os.ReadDir(netStateDir)
 	for _, e := range entries {
@@ -204,19 +227,23 @@ func reapStaleSlots() error {
 		// The runner that held this slot is gone: tear down its leftovers.
 		reclaimSlot(slot)
 		_ = os.Remove(filepath.Join(netStateDir, e.Name()))
+		reclaimed++
 	}
 
 	// Reclaim veths that no reservation accounts for.
 	vethSlots, err := existingVethSlots()
 	if err != nil {
-		return err
+		return reclaimed, err
 	}
 	for _, slot := range vethSlots {
-		if !reserved[slot] {
-			reclaimSlot(slot)
+		if reserved[slot] {
+			continue
 		}
+		reclaimSlot(slot)
+		reserved[slot] = true // also dedupes the pair's two ends (hkNh and hkNc)
+		reclaimed++
 	}
-	return nil
+	return reclaimed, nil
 }
 
 // reclaimSlot removes a slot's veth (and its peer) and NAT rule. It is best

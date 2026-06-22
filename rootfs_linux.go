@@ -65,8 +65,10 @@ func prepareRootfs(src string) (string, error) {
 
 // reapStaleRootfs removes per-run image copies whose creating process is gone,
 // so a crashed run does not leak its copy onto disk forever. A copy owned by a
-// live process is never touched, so this is safe to run concurrently.
-func reapStaleRootfs() {
+// live process is never touched, so this is safe to run concurrently. It
+// returns the number of copies removed.
+func reapStaleRootfs() int {
+	removed := 0
 	entries, _ := os.ReadDir(rootfsRunDir)
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -80,8 +82,11 @@ func reapStaleRootfs() {
 		if err != nil || alivePid(pid) {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(rootfsRunDir, e.Name()))
+		if os.RemoveAll(filepath.Join(rootfsRunDir, e.Name())) == nil {
+			removed++
+		}
 	}
+	return removed
 }
 
 // chownTree shifts every inode under root into the container's mapped id range:

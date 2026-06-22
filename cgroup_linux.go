@@ -100,7 +100,8 @@ func removeCgroup(dir string) {
 // host pid; an empty one for a dead pid is removable, and a leaf owned by a
 // live process is left alone. rmdir only succeeds when the group is empty, so a
 // still-draining group is skipped harmlessly.
-func reapStaleCgroups(parent string) {
+func reapStaleCgroups(parent string) int {
+	removed := 0
 	entries, _ := os.ReadDir(parent)
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -110,8 +111,11 @@ func reapStaleCgroups(parent string) {
 		if err != nil || alivePid(pid) {
 			continue
 		}
-		_ = os.Remove(filepath.Join(parent, e.Name()))
+		if os.Remove(filepath.Join(parent, e.Name())) == nil {
+			removed++
+		}
 	}
+	return removed
 }
 
 // requireControllers confirms that a cgroup has the named controllers enabled
