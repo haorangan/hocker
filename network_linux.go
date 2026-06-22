@@ -116,7 +116,7 @@ func allocNetSlot() (netConf, error) {
 		if err := runCmd("ip", "link", "add", conf.hostVeth, "type", "veth", "peer", "name", conf.contVeth); err != nil {
 			return err
 		}
-		if err := os.WriteFile(slotFile(slot), []byte(runnerToken()), 0644); err != nil {
+		if err := os.WriteFile(slotFile(slot), []byte(procToken(os.Getpid())), 0644); err != nil {
 			_ = runCmd("ip", "link", "del", conf.hostVeth)
 			return err
 		}
@@ -126,8 +126,13 @@ func allocNetSlot() (netConf, error) {
 }
 
 // gcNetwork reclaims leaked slots on demand, outside of any container run. It
-// returns the number of slots reclaimed.
+// returns the number of slots reclaimed. When no network state exists (no
+// container ever used --net) it is a pure no-op and does not create the state
+// directory.
 func gcNetwork() (int, error) {
+	if _, err := os.Stat(netStateDir); os.IsNotExist(err) {
+		return 0, nil
+	}
 	var n int
 	err := withNetLock(func() error {
 		var err error
@@ -220,13 +225,14 @@ func reapStaleSlots() (int, error) {
 		if err != nil {
 			continue
 		}
-		if runnerAlive(strings.TrimSpace(string(token))) {
+		if procTokenAlive(strings.TrimSpace(string(token))) {
 			reserved[slot] = true
 			continue
 		}
 		// The runner that held this slot is gone: tear down its leftovers.
 		reclaimSlot(slot)
 		_ = os.Remove(filepath.Join(netStateDir, e.Name()))
+		reserved[slot] = true // accounted for; do not also count it as an orphan
 		reclaimed++
 	}
 
@@ -323,28 +329,26 @@ func dropNAT(conf netConf) {
 	}
 }
 
-// runnerToken identifies the parent process that owns a slot. It is the pid
-// plus the process start time, so a recycled pid (a different process that
-// happens to reuse the number) is not mistaken for the original runner.
-func runnerToken() string {
-	return fmt.Sprintf("%d %d", os.Getpid(), procStarttime(os.Getpid()))
+// procToken identifies the process that owns a resource: its pid plus the
+// process start time, so a recycled pid (a different process that later reuses
+// the number) is not mistaken for the original owner. It is filename-safe, so
+// it serves both as reservation-file content and as a directory-name component
+// for cgroup leaves and rootfs copies.
+func procToken(pid int) string {
+	return fmt.Sprintf("%d-%d", pid, procStarttime(pid))
 }
 
-// runnerAlive reports whether the runner recorded in a reservation token is
-// still the live process that wrote it: the pid must be alive and, when a start
-// time is recorded, it must still match.
-func runnerAlive(token string) bool {
-	fields := strings.Fields(token)
-	if len(fields) == 0 {
-		return false
-	}
-	pid, err := strconv.Atoi(fields[0])
+// procTokenAlive reports whether the process named by a "pid-starttime" token
+// is still that same live process: the pid must be alive and, when a start time
+// is recorded, it must still match.
+func procTokenAlive(token string) bool {
+	pidStr, stStr, _ := strings.Cut(token, "-")
+	pid, err := strconv.Atoi(pidStr)
 	if err != nil || !alivePid(pid) {
 		return false
 	}
-	if len(fields) >= 2 {
-		want, _ := strconv.ParseInt(fields[1], 10, 64)
-		if want != 0 && procStarttime(pid) != want {
+	if want, err := strconv.ParseInt(stStr, 10, 64); err == nil && want != 0 {
+		if procStarttime(pid) != want {
 			return false
 		}
 	}

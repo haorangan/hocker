@@ -49,7 +49,9 @@ func setupCgroupParent(hostPid int) (string, error) {
 		return "", err
 	}
 
-	leaf := filepath.Join(parent, strconv.Itoa(hostPid))
+	// Name the leaf for the child's pid and start time, so a leftover leaf from
+	// a crashed run is not confused with a live container that recycled the pid.
+	leaf := filepath.Join(parent, procToken(hostPid))
 	if err := os.MkdirAll(leaf, 0755); err != nil {
 		return "", err
 	}
@@ -104,11 +106,7 @@ func reapStaleCgroups(parent string) int {
 	removed := 0
 	entries, _ := os.ReadDir(parent)
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || alivePid(pid) {
+		if !e.IsDir() || procTokenAlive(e.Name()) {
 			continue
 		}
 		if os.Remove(filepath.Join(parent, e.Name())) == nil {

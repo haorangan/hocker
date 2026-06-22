@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 )
@@ -48,7 +47,7 @@ func prepareRootfs(src string) (string, error) {
 	}
 	reapStaleRootfs() // clear copies left by crashed runs before adding ours
 
-	dst := filepath.Join(rootfsRunDir, fmt.Sprintf("rootfs-%d", os.Getpid()))
+	dst := filepath.Join(rootfsRunDir, "rootfs-"+procToken(os.Getpid()))
 	if err := os.RemoveAll(dst); err != nil {
 		return "", err
 	}
@@ -64,9 +63,10 @@ func prepareRootfs(src string) (string, error) {
 }
 
 // reapStaleRootfs removes per-run image copies whose creating process is gone,
-// so a crashed run does not leak its copy onto disk forever. A copy owned by a
-// live process is never touched, so this is safe to run concurrently. It
-// returns the number of copies removed.
+// so a crashed run does not leak its copy onto disk forever. Each copy is named
+// for its owner's pid and start time, so a copy belonging to a live process (or
+// a recycled pid) is never touched, which makes this safe to run concurrently.
+// It returns the number of copies removed.
 func reapStaleRootfs() int {
 	removed := 0
 	entries, _ := os.ReadDir(rootfsRunDir)
@@ -74,12 +74,8 @@ func reapStaleRootfs() int {
 		if !e.IsDir() {
 			continue
 		}
-		num, ok := strings.CutPrefix(e.Name(), "rootfs-")
-		if !ok {
-			continue
-		}
-		pid, err := strconv.Atoi(num)
-		if err != nil || alivePid(pid) {
+		token, ok := strings.CutPrefix(e.Name(), "rootfs-")
+		if !ok || procTokenAlive(token) {
 			continue
 		}
 		if os.RemoveAll(filepath.Join(rootfsRunDir, e.Name())) == nil {

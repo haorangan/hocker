@@ -19,6 +19,9 @@ func gc(args []string) {
 		os.Exit(1)
 	}
 
+	// The cgroup and rootfs reapers need no lock: each only removes a leftover
+	// whose owning process (identified by pid and start time) is gone, so it
+	// can never touch a live container's resources.
 	slots, err := gcNetwork()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "hocker gc: network:", err)
@@ -28,4 +31,7 @@ func gc(args []string) {
 
 	fmt.Printf("hocker gc: reclaimed %d network slot(s), %d cgroup(s), %d rootfs copy(ies)\n",
 		slots, cgroups, rootfs)
+	if err != nil {
+		os.Exit(1)
+	}
 }
