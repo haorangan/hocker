@@ -1,7 +1,7 @@
 BINARY  := hocker
 GOARCH  ?= arm64
 
-.PHONY: build build-linux vet test rootfs clean
+.PHONY: build build-linux vet fmt test rootfs clean
 
 # Build for the host. On macOS this only type-checks; the binary will not run.
 build:
@@ -13,6 +13,9 @@ build-linux:
 
 vet:
 	go vet ./...
+
+fmt:
+	gofmt -w .
 
 # Run the integration tests. They need Linux, root, and a cgroup v2 host. They
 # download a rootfs unless HOCKER_TEST_ROOTFS points at one already, e.g.
